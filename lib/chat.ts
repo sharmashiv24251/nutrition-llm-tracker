@@ -4,7 +4,7 @@ import { runAgent, type ToolLog } from "./agent";
 import type { DataLayer } from "./data";
 import type { Model, ModelTurn } from "./llm";
 import { costOf, priceAt, type PriceRow } from "./pricing";
-import { systemPrompt, type Mode } from "./prompt";
+import { RECENT_FOOD_DAYS, systemPrompt, type Mode } from "./prompt";
 import type { Row, Store } from "./store";
 import type { ToolCtx } from "./tools";
 
@@ -113,8 +113,10 @@ export async function handleChat(input: ChatInput, deps: ChatDeps): Promise<Chat
     return { answer: turn.text, sources: turn.sources.slice(0, 5), queries: turn.searchQueries };
   };
 
-  const [status, context] = await Promise.all([
+  // The food chat gets the foods I logged this week in its prompt, so they're logged by id with no lookup.
+  const [status, recentFoods, context] = await Promise.all([
     data.getStatus(now),
+    input.mode === "food" ? data.recentFoods(RECENT_FOOD_DAYS, now) : Promise.resolve([]),
     store.rpc<{ role: "user" | "assistant"; content: string; has_image: boolean }[]>("trk_model_context", {
       p_mode: input.mode, p_day: day, p_limit: 20,
     }),
@@ -137,7 +139,7 @@ export async function handleChat(input: ChatInput, deps: ChatDeps): Promise<Chat
       model,
       mode: input.mode,
       ctx: { data, messageId: userMsg.id, search, freshFoodIds: new Set() },
-      system: systemPrompt(input.mode, status),
+      system: systemPrompt(input.mode, status, recentFoods),
       history,
       user: { role: "user", parts: userParts },
       hooks: {

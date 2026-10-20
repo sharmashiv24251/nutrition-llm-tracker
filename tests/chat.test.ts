@@ -270,17 +270,38 @@ describe.skipIf(!hasPostgres)("chat route logic", () => {
     expect(day1.body.turn.user.has_image).toBe(true);
     expect(day1.body.turn.food_entries[0]).toMatchObject({ grams: 30, kcal: 118, protein_g: 24, confidence: "label" });
 
+    // Next day it's in the food chat's prompt with its id and scoop size, so it's logged with no lookup at all.
+    const foodId = day1.body.turn.food_entries[0].food_id;
     clock = new Date("2026-11-21T09:00:00Z");
-    const day2 = await chat(msg("30g nakpro perform", { mode: "food" }), [
-      () => call("find_food", { query: "nakpro perform" }),
-      ({ lastResults }) => call("log_food", { day: "2026-11-21", items: [{
-        raw_text: "30g nakpro perform", display_name: "Nakpro Perform", food_id: lastResults.find_food.result.best.id,
-        quantity: 30, unit: "g",
-      }] }),
+    const day2 = await chat(msg("1 scoop nakpro perform", { mode: "food" }), [
+      ({ system }) => {
+        expect(system).toContain(`Nakpro Perform Whey (also: nakpro perform): food_id ${foodId}`);
+        expect(system).toContain("1 scoop = 33 g; logged 1x, last 2026-11-20");
+        return call("log_food", { day: "2026-11-21", items: [{
+          raw_text: "1 scoop nakpro perform", display_name: "Nakpro Perform", food_id: foodId, quantity: 1, unit: "scoop",
+        }] });
+      },
       () => say("Logged."),
     ]);
+    expect(day2.model.requests.length).toBe(2);
     expect(day2.model.requests.some((r) => r.googleSearch)).toBe(false);
-    expect(day2.body.turn.food_entries[0]).toMatchObject({ grams: 30, kcal: 118, protein_g: 24, confidence: "saved" });
+    expect(day2.body.turn.food_entries[0]).toMatchObject({ grams: 33, confidence: "saved" });
+    expect(Number(day2.body.turn.food_entries[0].protein_g)).toBeCloseTo(26.4);
+
+    // The workout chat doesn't carry the list.
+    const workout = await chat(msg("hi"), [({ system }) => {
+      expect(system).not.toContain("MY RECENT FOODS (");
+      return say("hi");
+    }]);
+    expect(workout.status).toBe(200);
+
+    // A week without it drops it from the prompt; it stays in the library for find_food.
+    clock = new Date("2026-11-28T09:00:00Z");
+    await chat(msg("hi", { mode: "food" }), [({ system }) => {
+      expect(system).not.toContain(foodId);
+      expect(system).toContain("MY RECENT FOODS (");
+      return say("hi");
+    }]);
     expect((await q`select count(*)::int as n from trk_foods`)[0].n).toBe(1);
     // Images are never stored: only the has_image flag.
     expect((await q`select content from trk_messages where has_image`)[0].content).toBe("30g of this");

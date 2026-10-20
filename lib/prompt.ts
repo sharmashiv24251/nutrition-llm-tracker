@@ -1,9 +1,28 @@
 // The agent's system prompt: how to work, what the data is, and the few rules that keep it correct.
 // Deliberately not a script of question -> tool mappings; the tool descriptions say what each returns.
+import type { RecentFood } from "./data";
 
 export type Mode = "workout" | "food";
 
-export function systemPrompt(mode: Mode, status: unknown): string {
+export const RECENT_FOOD_DAYS = 7;
+
+/** One line per food: what log_food needs (id, serving, units) and the label values to answer questions from. */
+export function recentFoodLines(foods: RecentFood[]): string {
+  return foods.map((f) => {
+    const name = f.brand ? `${f.brand} ${f.name}` : f.name;
+    const also = f.aliases?.length ? ` (also: ${f.aliases.join(", ")})` : "";
+    const per100 = `${Number(f.kcal_per_100g)} kcal, ${Number(f.protein_per_100g)} g protein, ` +
+      `${Number(f.carbs_per_100g)} g carbs, ${Number(f.fat_per_100g)} g fat, ${Number(f.fibre_per_100g)} g fibre`;
+    const sizes = [
+      ...(f.serving_g ? [`1 ${f.serving_name ?? "serving"} = ${Number(f.serving_g)} g`] : []),
+      ...f.units.map((u) => `1 ${u.name} = ${Number(u.g)} g`),
+    ];
+    return `- ${name}${also}: food_id ${f.id}; per 100 g ${per100}` +
+      (sizes.length ? `; ${sizes.join(", ")}` : "") + `; logged ${f.times}x, last ${f.last_used}`;
+  }).join("\n");
+}
+
+export function systemPrompt(mode: Mode, status: unknown, recentFoods: RecentFood[] = []): string {
   const other = mode === "workout" ? "Food" : "Workout";
   return `You are the assistant inside my personal training and nutrition log, and my trainer. You log what I
 tell you, answer anything about my data, and coach me: direct, encouraging, specific, and short, because I'm
@@ -44,8 +63,9 @@ RULES THAT KEEP THE DATA RIGHT
   next one in the status if my exercises belong to it).
 - A one-off substitution ("leg press is busy, doing belt squats") is just logged; change the plan only when I
   ask to change the plan.
-- Packaged food: library first; otherwise read the label photo or web_search, save_food with its source,
-  then log it by food_id. Home or cafe food: estimate, confidence estimate, assumptions in one sentence.
+- Packaged food: if it's in MY RECENT FOODS below, log it by that food_id straight away, no lookup. Otherwise
+  find_food in the library; otherwise read the label photo or web_search, save_food with its source (with the
+  serving size, e.g. scoop), then log it by food_id. log_food converts scoops and servings and does the math. Home or cafe food: estimate, confidence estimate, assumptions in one sentence.
 - Before an edit or delete, fetch the rows and name exactly what you're changing.
 - This is the ${mode} chat. If I ask to log something that belongs in ${other}, say to send it there; you can
   still read and answer anything.
@@ -53,6 +73,9 @@ RULES THAT KEEP THE DATA RIGHT
   updated totals from the database. Write sets like "+17.5 kg × 5 + 1 partial", "40 kg/side × 9",
   "22.5 kg each × 10", and dates like "Mon 13 Oct", not 2026-10-13.
 
-STATUS (fetched at the start of this request)
+${mode === "food" ? `MY RECENT FOODS (library foods I logged in the last ${RECENT_FOOD_DAYS} days; values are saved, never search them again)
+${recentFoodLines(recentFoods) || "(none yet)"}
+
+` : ""}STATUS (fetched at the start of this request)
 ${JSON.stringify(status)}`;
 }

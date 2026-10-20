@@ -15,7 +15,17 @@ type Ctx = {
   freshFoodIds?: ReadonlySet<string>;
 };
 
-const MACRO_KEYS = ["kcal", "protein_g", "carbs_g", "fat_g", "fibre_g"] as const;
+export type RecentFood = Per100 & {
+  id: string;
+  name: string;
+  brand: string | null;
+  aliases: string[];
+  units: { name: string; g: number }[];
+  last_used: string;
+  times: number;
+};
+
+const MACRO_KEYS =["kcal", "protein_g", "carbs_g", "fat_g", "fibre_g"] as const;
 
 export class InputError extends Error {
   constructor(message: string) {
@@ -54,6 +64,13 @@ export function dataLayer(store: Store, opts: { now?: () => Date } = {}) {
       const foods = await store.list("trk_foods");
       const matches: Row[] = rank(query, foods, foodNames).map((m) => ({ ...m.item, score: m.score, matched: m.matched }));
       return { matches, best: matches[0] && matches[0].score >= CLOSE_MATCH ? matches[0] : null };
+    },
+
+    /** Library foods logged in the last `days` logical days, most recent first (the food chat's prompt list). */
+    async recentFoods(days: number, at?: Date) {
+      return store.rpc<RecentFood[]>("trk_recent_foods", {
+        p_at: (at ?? now()).toISOString(), p_days: z.int().min(1).max(60).parse(days),
+      });
     },
 
     async saveFood(input: z.input<typeof S.SaveFood>, ctx: Ctx = {}) {
