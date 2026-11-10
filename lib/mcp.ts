@@ -48,6 +48,12 @@ RULES THAT KEEP THE DATA RIGHT
   confidence "estimate", and the assumptions (portion, oil, milk type) in one sentence so I can correct them.
 - Drinks count toward water: log the liquid in shakes, milk and electrolyte drinks with log_water as well as
   their calories with log_food.
+- Before my first set of an exercise (or when I ask what I did last time), call find_exercise and
+  get_exercise_history, tell me my last sets in plain words, and suggest a target for today.
+- When we agree a target, save it with save_note (kind plan, title like "Weighted pull-up target"); pass the
+  existing note's id to update it rather than adding a near-duplicate. get_notes brings it back next time.
+- When I log sets, compare them with the saved target, say whether I hit it, and update the note with the
+  next target.
 - The first sets of a day: tag the session with the program day I'm doing. A one-off substitution is just
   logged; change the plan only when I ask.
 - Before an edit or delete, fetch the rows with get_entries and say exactly what you're changing.
