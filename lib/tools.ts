@@ -2,13 +2,16 @@
 // Handlers only call the data layer, which only touches trk_ tables through parameterised calls.
 import type { FunctionDeclaration } from "@google/genai";
 import { z } from "zod";
-import type { DataLayer } from "./data";
+import type { DataLayer, Source } from "./data";
 import type { Mode } from "./prompt";
 import * as S from "./schemas";
 
 export type ToolCtx = {
   data: DataLayer;
-  messageId: string;
+  /** The chat message that caused the call; absent for MCP clients, which keep their own conversation. */
+  messageId?: string | null;
+  /** Who is calling, recorded in the edit log (default "llm", the in-app chat). */
+  source?: Source;
   /** Library foods saved from a label or the web during this turn (filled in by save_food). */
   freshFoodIds?: Set<string>;
   /** The web_search implementation (a separate grounded Gemini call); absent means the tool isn't offered. */
@@ -17,7 +20,7 @@ export type ToolCtx = {
 
 type Tool<T extends z.ZodType = z.ZodType> = {
   name: string;
-  /** Modes that get this tool; fewer declarations means fewer input tokens on every call. */
+  /** In-app chat modes that get this tool; fewer declarations means fewer input tokens on every call. */
   modes?: Mode[];
   description: string;
   schema: T;
@@ -26,7 +29,9 @@ type Tool<T extends z.ZodType = z.ZodType> = {
 
 const tool = <T extends z.ZodType>(t: Tool<T>) => t as unknown as Tool;
 
-const llm = (ctx: ToolCtx) => ({ source: "llm" as const, messageId: ctx.messageId });
+const llm = (ctx: ToolCtx) => ({ source: ctx.source ?? ("llm" as const), messageId: ctx.messageId ?? null });
+/** Tools only MCP clients get: the in-app chats are for lifting and food, and each declaration costs them tokens. */
+const MCP_ONLY: Mode[] = [];
 const day = z.iso.date().describe("Logical day, YYYY-MM-DD");
 const none = z.object({});
 
@@ -36,15 +41,21 @@ export const TOOLS: Tool[] = [
   // ───────────── reading: days and history ─────────────
   tool({
     name: "get_status",
-    description: "Returns now: today's and yesterday's logical day, days still open, today's food totals vs targets, the active workout session (if any), the active program and which program day is next in the rotation. Already included at the start of each request; call again for fresh state.",
+    description: "Returns now: the current time, today's and yesterday's logical day, days still open, today's food totals vs targets, the active workout session (if any), the active program and which program day is next in the rotation, and today's water, activity, sleep, check-in and routine ticks. Call it before anything that depends on the date or on what's already logged today.",
     schema: none,
-    run: (_, { data }) => data.getStatus(),
+    run: async (_, { data }) => {
+      const status = await data.getStatus();
+      return { ...status, today_wellness: await data.dayWellness(status.today) };
+    },
   }),
   tool({
     name: "get_day_report",
-    description: "Returns everything about one day: food by meal (each entry with grams, macros, confidence, assumptions) and totals vs targets, every workout session with sets grouped by exercise, the previous top set for each exercise trained, bodyweight, the day's status (complete/incomplete/missed) and its written recap.",
+    description: "Returns everything about one day: food by meal (each entry with grams, macros, confidence, assumptions) and totals vs targets, every workout session with sets grouped by exercise, the previous top set for each exercise trained, bodyweight, the day's status (complete/incomplete/missed) and its written recap, plus water vs target, activities and calories burned, steps, sleep, the check-in, measurements and which routine items were ticked.",
     schema: z.object({ day }),
-    run: (a, { data }) => data.dayReport(a.day),
+    run: async (a, { data }) => {
+      const [report, wellness] = await Promise.all([data.dayReport(a.day), data.dayWellness(a.day)]);
+      return { ...report, wellness };
+    },
   }),
   tool({
     name: "get_history",
@@ -54,7 +65,7 @@ export const TOOLS: Tool[] = [
   }),
   tool({
     name: "get_entries",
-    description: "Returns the raw rows (with ids) for food entries, sets or bodyweight readings between two days inclusive (max 62 days). Use it to find the exact row before an edit or delete.",
+    description: "Returns the raw rows (with ids) of one type between two days inclusive (max 62 days): food, sets, bodyweight, water, activity, measurement, sleep, checkin or routine. Use it to find the exact row before an edit or delete.",
     schema: S.DayRange,
     run: (a, { data }) => data.getEntries(a),
   }),
@@ -194,6 +205,103 @@ export const TOOLS: Tool[] = [
     run: (a, ctx) => ctx.data.logFood(a, { ...llm(ctx), freshFoodIds: ctx.freshFoodIds }),
   }),
 
+  // ───────────── water, activity, body, sleep, check-ins ─────────────
+  tool({
+    name: "log_water",
+    modes: MCP_ONLY,
+    description: "Saves drinks toward the day's water: each glass or bottle, and the liquid in shakes, milk and electrolyte drinks. Returns the saved rows and the day's total against the water target.",
+    schema: S.LogWater,
+    run: (a, { data }) => data.logWater(a),
+  }),
+  tool({
+    name: "log_activity",
+    modes: MCP_ONLY,
+    description: "Saves a walk, run, sport or other activity with duration, distance and calories burned. Lifting with sets goes to log_sets instead. Returns the row and the day's activity totals.",
+    schema: S.LogActivity,
+    run: (a, { data }) => data.logActivity(a),
+  }),
+  tool({
+    name: "log_measurements",
+    modes: MCP_ONLY,
+    description: "Saves body or daily numbers other than bodyweight: body fat %, waist and other tape measurements, the day's step count, resting heart rate. Returns the saved rows.",
+    schema: S.LogMeasurements,
+    run: (a, { data }) => data.logMeasurements(a),
+  }),
+  tool({
+    name: "log_sleep",
+    modes: MCP_ONLY,
+    description: "Saves last night's sleep against the day I woke up: bed time, wake time (or just hours) and quality. One night per day, so calling it again for the same day corrects it. Returns the row.",
+    schema: S.LogSleep,
+    run: (a, ctx) => ctx.data.logSleep(a, llm(ctx)),
+  }),
+  tool({
+    name: "log_checkin",
+    modes: MCP_ONLY,
+    description: "Saves the day's check-in: energy, mood, stress and hunger (1 to 5) and how my skin looks. One per day; calling it again fills in or corrects the fields given. Returns the row.",
+    schema: S.LogCheckin,
+    run: (a, ctx) => ctx.data.logCheckin(a, llm(ctx)),
+  }),
+  tool({
+    name: "get_trends",
+    modes: MCP_ONLY,
+    description: "Returns trends over the last N days: one row per day (weight, 7-day average weight, kcal, protein, water, sleep, steps, calories burned, check-in scores), weekly averages, the weight trend (this week's 7-day average vs last week's), the latest body measurements, and each routine item's streak. Use it for 'how's my weight going', weekly reviews and streaks.",
+    schema: z.object({ days: z.int().min(7).max(180).default(30) }),
+    run: (a, { data }) => data.trends(a.days),
+  }),
+
+  // ───────────── routines: supplements, skincare ─────────────
+  tool({
+    name: "get_routine",
+    modes: MCP_ONLY,
+    description: "Returns my routine items (supplements, skincare, other) with dose and schedule, and which are ticked off on a day (default today).",
+    schema: z.object({ day: day.optional() }),
+    run: (a, { data }) => data.routine(a.day),
+  }),
+  tool({
+    name: "tick_routine",
+    modes: MCP_ONLY,
+    description: "Ticks routine items off for a day when I say I took or applied them. Names are fuzzy-matched; ticking something already done changes nothing. Returns what was ticked, anything not recognised, and what's still to do that day.",
+    schema: S.TickRoutine,
+    run: (a, { data }) => data.tickRoutine(a),
+  }),
+  tool({
+    name: "save_routine_item",
+    modes: MCP_ONLY,
+    description: "Adds a supplement, skincare product or other daily habit to my routine, or updates one (same name, or by id): dose, schedule, other names, or active=false to retire it. Returns the item.",
+    schema: S.SaveRoutineItem,
+    run: (a, ctx) => ctx.data.saveRoutineItem(a, llm(ctx)),
+  }),
+
+  // ───────────── notes, decisions, targets ─────────────
+  tool({
+    name: "get_notes",
+    modes: MCP_ONLY,
+    description: "Returns what's been saved about me, newest first: my profile, goals, current plan, past decisions with their reasons, and other notes. Read it before giving advice so it fits what we already decided.",
+    schema: S.GetNotes,
+    run: (a, { data }) => data.getNotes(a),
+  }),
+  tool({
+    name: "save_note",
+    modes: MCP_ONLY,
+    description: "Saves something worth remembering in later conversations: a fact about me (profile), a goal, the current plan, or a decision and why we made it. Pass id to rewrite an existing note rather than adding a near-duplicate. Returns the note.",
+    schema: S.SaveNote,
+    run: (a, ctx) => ctx.data.saveNote(a, llm(ctx)),
+  }),
+  tool({
+    name: "set_targets",
+    modes: MCP_ONLY,
+    description: "Changes my daily targets from a day onward: kcal ceiling, protein and fibre floors, optional carbs and fat, and a water floor. Targets not given carry over. The reason is saved as a decision note. Only when I ask to change them. Returns the new targets and the previous values.",
+    schema: S.SetTargets,
+    run: (a, ctx) => ctx.data.setTargets(a, llm(ctx)),
+  }),
+  tool({
+    name: "undo_edit",
+    modes: MCP_ONLY,
+    description: "Undoes an edit or delete made with update_entry or delete_entry: the most recent one, or the one with the given edit_id. Returns the restored row.",
+    schema: z.object({ edit_id: z.uuid().optional() }),
+    run: (a, ctx) => ctx.data.undoEdit(a.edit_id, ctx.source ?? "llm"),
+  }),
+
   // ───────────── writing: both chats ─────────────
   tool({
     name: "log_bodyweight",
@@ -203,13 +311,13 @@ export const TOOLS: Tool[] = [
   }),
   tool({
     name: "update_entry",
-    description: "Edits one row by id (food entry, set, session, bodyweight, food, exercise, unit, program exercise) and records it in the edit log. Changing only a food entry's grams or quantity recomputes its macros. Returns before and after.",
+    description: "Edits one row by id (food entry, set, session, bodyweight, food, exercise, unit, program exercise, water, activity, measurement, sleep, check-in, routine item, note) and records it in the edit log. Changing only a food entry's grams or quantity recomputes its macros. Returns before and after.",
     schema: S.UpdateEntry,
     run: (a, ctx) => ctx.data.updateEntry(a, llm(ctx)),
   }),
   tool({
     name: "delete_entry",
-    description: "Soft-deletes one row by id and records it in the edit log (undoable). Returns what was deleted.",
+    description: "Soft-deletes one row by id and records it in the edit log (undoable). Returns what was deleted. Un-tick a routine item by deleting its trk_routine_logs row (log_id in the day's routine).",
     schema: S.DeleteEntry,
     run: (a, ctx) => ctx.data.deleteEntry(a, llm(ctx)),
   }),

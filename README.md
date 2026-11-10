@@ -61,6 +61,22 @@ longest?", "which days was I under 100 g protein?".
   rule-of-thumb suggestion from `lib/coach.ts` (double progression) as a quick visual hint; the AI doesn't
   see it.
 
+## Use it from ChatGPT or Claude (MCP)
+
+`/api/mcp` serves the same tools over the Model Context Protocol, so the log can be driven from the ChatGPT or
+Claude apps (voice typing, photos, their model, no Gemini spend). Add `https://<your-site>/api/mcp` as a custom
+connector / MCP server, with no authentication.
+
+- **Stateless streamable HTTP** (`lib/mcp.ts`, `app/api/mcp/route.ts`): each POST is one JSON-RPC message
+  answered with JSON. Every tool in `lib/tools.ts` is listed except `web_search` (the client searches itself).
+  The rules from the in-app prompt are sent as the server's instructions. Writes are recorded with source `mcp`.
+- **There is no login.** Anyone who has the URL can read and change the log. It has its own rate limit
+  (20 requests a second).
+- **MCP-only trackers** (not offered to the in-app chats): water, activities, body measurements and steps,
+  sleep, a daily check-in, routine items ticked once a day (supplements, skincare) with streaks, notes
+  (profile, goals, plan, decisions), targets with the reason saved, sodium on food, trends (7-day average
+  weight, weekly averages) and undo. These have no screens yet; `get_day_report` and `get_trends` return them.
+
 ## Nightly recap
 
 `vercel.json` runs `GET /api/cron/daily-summary` daily at `30 4 * * *` UTC. That is 04:30–05:00 Dublin time in

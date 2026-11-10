@@ -11,6 +11,8 @@ export const FOOD_SOURCES = ["label_photo", "web", "manual", "estimate"] as cons
 export const EDITABLE_TABLES = [
   "trk_food_entries", "trk_sets", "trk_workout_sessions", "trk_bodyweight", "trk_foods", "trk_exercises",
   "trk_household_units", "trk_program_exercises",
+  "trk_water", "trk_activities", "trk_measurements", "trk_sleep", "trk_checkins", "trk_routine_items",
+  "trk_routine_logs", "trk_notes",
 ] as const;
 /** Settings-page tables, edited from the UI only. */
 export const SETTINGS_TABLES = ["trk_targets", "trk_pricing", "trk_settings", "trk_household_units"] as const;
@@ -22,7 +24,7 @@ const nonneg = z.number().nonnegative();
 export const DayRange = z.object({
   from: day,
   to: day,
-  type: z.enum(["food", "sets", "bodyweight"]),
+  type: z.enum(["food", "sets", "bodyweight", "water", "activity", "measurement", "sleep", "checkin", "routine"]),
 });
 
 export const FoodQuery = z.object({ query: z.string().min(1).max(200) });
@@ -37,6 +39,7 @@ export const SaveFood = z.object({
   carbs_per_100g: nonneg.default(0),
   fat_per_100g: nonneg.default(0),
   fibre_per_100g: nonneg.default(0),
+  sodium_mg_per_100g: nonneg.nullish().describe("From the label when it has one (salt g x 400 = sodium mg); omit if unknown"),
   serving_name: z.string().max(60).nullish().describe("e.g. 'scoop', 'bar', 'piece'"),
   serving_g: z.number().positive().nullish(),
   source: z.enum(FOOD_SOURCES),
@@ -57,6 +60,7 @@ export const FoodItem = z.object({
   carbs_g: nonneg.optional(),
   fat_g: nonneg.optional(),
   fibre_g: nonneg.optional(),
+  sodium_mg: nonneg.optional().describe("Estimate it when you reasonably can (salty, packaged or restaurant food); omit rather than guess 0"),
   confidence: z.enum(CONFIDENCE).optional(),
   assumptions: z.string().max(500).optional().describe("One sentence, e.g. 'assumed 100 g paneer and 2 tbsp oil.'"),
 });
@@ -163,4 +167,104 @@ export const SetDayCompleteness = z.object({
   completeness: z.enum(COMPLETENESS).nullable()
     .describe("complete = whole day logged; incomplete = something missing, leave out of averages; missed = not logged; null clears it"),
   note: z.string().max(300).nullish(),
+});
+
+// ───────────── water, activity, body, sleep, check-ins, routines, notes ─────────────
+
+const optionalDay = day.optional().describe("Logical day, YYYY-MM-DD; omit for today");
+const at = z.iso.datetime({ offset: true });
+const score = z.int().min(1).max(5);
+
+export const LogWater = z.object({
+  day: optionalDay,
+  drinks: z.array(z.object({
+    ml: z.int().positive().max(5000).describe("A glass is about 250 ml, a mug 300 ml, a bottle whatever I say it is"),
+    drink: z.string().trim().min(1).max(40).default("water").describe("water, milk, electrolytes, tea, coffee, ..."),
+    drunk_at: at.optional(),
+    note: z.string().max(200).optional(),
+  })).min(1).max(20),
+});
+
+export const LogActivity = z.object({
+  day: optionalDay,
+  kind: z.string().trim().toLowerCase().min(1).max(40).describe("walk, run, cycle, swim, gym, football, ..."),
+  started_at: at.optional(),
+  duration_min: z.number().positive().max(1440).optional(),
+  distance_km: nonneg.max(500).optional(),
+  kcal_burned: nonneg.max(10000).optional().describe("From my device if I gave it, else your estimate from duration, pace and my bodyweight"),
+  steps: z.int().nonnegative().optional().describe("Steps in this activity only; the day's total goes to log_measurements as 'steps'"),
+  note: z.string().max(300).optional().describe("Include how kcal_burned was estimated"),
+  raw_text: z.string().min(1).max(4000).describe("My exact words"),
+});
+
+export const LogMeasurements = z.object({
+  day: optionalDay,
+  measured_at: at.optional(),
+  readings: z.array(z.object({
+    metric: z.string().regex(/^[a-z][a-z0-9_]{1,39}$/)
+      .describe("snake_case with the unit: body_fat_pct, waist_cm, chest_cm, hips_cm, arm_cm, thigh_cm, steps (the day's total), resting_hr. Reuse names already in get_trends. Bodyweight goes to log_bodyweight"),
+    value: z.number(),
+    note: z.string().max(200).optional(),
+  })).min(1).max(20),
+});
+
+export const LogSleep = z.object({
+  day: optionalDay.describe("The day I woke up, YYYY-MM-DD; omit to take it from wake_at, or today"),
+  bed_at: at.optional(),
+  wake_at: at.optional(),
+  hours: z.number().positive().max(24).optional().describe("Omit when bed_at and wake_at are both given"),
+  quality: score.optional().describe("1 awful to 5 great"),
+  note: z.string().max(300).optional(),
+});
+
+export const LogCheckin = z.object({
+  day: optionalDay,
+  energy: score.optional().describe("1 low to 5 high"),
+  mood: score.optional().describe("1 low to 5 high"),
+  stress: score.optional().describe("1 calm to 5 very stressed"),
+  hunger: score.optional().describe("1 not hungry to 5 ravenous"),
+  skin: z.string().max(300).optional().describe("How my skin looks, in my words"),
+  note: z.string().max(500).optional(),
+});
+
+export const ROUTINE_KINDS = ["supplement", "skincare", "other"] as const;
+
+export const SaveRoutineItem = z.object({
+  id: uuid.optional().describe("Set to update an existing item"),
+  name: z.string().trim().min(1).max(80),
+  aliases: z.array(z.string().trim().min(1).max(80)).max(20).optional(),
+  kind: z.enum(ROUTINE_KINDS),
+  dose: z.string().max(80).nullish().describe("'5 g', '2 capsules', 'pea-sized amount'"),
+  schedule: z.string().max(80).nullish().describe("'night', 'morning', 'mon/wed/fri'; null means every day"),
+  active: z.boolean().optional().describe("false retires it without losing its history"),
+});
+
+export const TickRoutine = z.object({
+  day: optionalDay,
+  items: z.array(z.string().min(1).max(80)).max(30).default([]).describe("Names as I said them ('d3', 'sunscreen') or item ids"),
+  all_of_kind: z.enum(ROUTINE_KINDS).optional().describe("Tick every active item of this kind: 'took my supplements'"),
+});
+
+export const NOTE_KINDS = ["profile", "goal", "plan", "decision", "note"] as const;
+
+export const SaveNote = z.object({
+  id: uuid.optional().describe("Set to rewrite an existing note instead of adding one"),
+  kind: z.enum(NOTE_KINDS)
+    .describe("profile = lasting facts about me; goal; plan = what I'm doing now; decision = something we decided, with why; note = anything else"),
+  title: z.string().trim().min(1).max(120),
+  body: z.string().trim().min(1).max(4000),
+  day: optionalDay,
+});
+
+export const GetNotes = z.object({ kind: z.enum(NOTE_KINDS).optional() });
+
+export const SetTargets = z.object({
+  effective_from: optionalDay.describe("First day the targets apply, YYYY-MM-DD; omit for today"),
+  kcal: nonneg.optional().describe("Daily ceiling"),
+  protein_g: nonneg.optional().describe("Daily floor"),
+  fibre_g: nonneg.optional().describe("Daily floor"),
+  carbs_g: nonneg.nullish().describe("Optional; null removes it"),
+  fat_g: nonneg.nullish().describe("Optional; null removes it"),
+  water_ml: z.int().positive().nullish().describe("Daily floor; null removes it"),
+  reason: z.string().trim().min(1).max(1000).describe("Why they're changing; saved as a decision note"),
 });

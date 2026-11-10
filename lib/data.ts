@@ -5,9 +5,9 @@ import { agentBrief, coachBrief, type BriefExercise } from "./coach";
 import { CLOSE_MATCH, rank } from "./fuzzy";
 import * as S from "./schemas";
 import type { Row, Store, Table } from "./store";
-import { macrosFor, resolveGrams, scaleMacros, type HouseholdUnit, type Macros, type Per100 } from "./units";
+import { macrosFor, resolveGrams, round1, scaleMacros, type HouseholdUnit, type Macros, type Per100 } from "./units";
 
-export type Source = "llm" | "ui";
+export type Source = "llm" | "ui" | "mcp";
 type Ctx = {
   source?: Source;
   messageId?: string | null;
@@ -34,12 +34,29 @@ export class InputError extends Error {
   }
 }
 
+const routineNames = (i: Row) => [i.name, ...(i.aliases ?? [])];
+/** Sodium for `grams` of a library food, or null when its label value isn't saved. */
+const sodiumFor = (food: Row, grams: number) =>
+  food.sodium_mg_per_100g == null ? null : round1(Number(food.sodium_mg_per_100g) * grams / 100);
 const foodNames = (f: Row) => [f.name, ...(f.aliases ?? []), ...(f.brand ? [`${f.brand} ${f.name}`] : [])];
 const exerciseNames = (e: Row) => [e.name, ...(e.aliases ?? [])];
 
 export function dataLayer(store: Store, opts: { now?: () => Date } = {}) {
   const now = () => opts.now?.() ?? new Date();
   const today = () => store.rpc<string>("trk_logical_day", { p_at: now().toISOString() });
+  /** The logical day a moment falls in (default: now). */
+  const logicalDay = (at?: string) => store.rpc<string>("trk_logical_day", { p_at: at ?? now().toISOString() });
+
+  /** Inserts a row, or applies the given fields to the existing one through the edit log. */
+  async function upsert(table: Table, existing: Row | undefined | null, fields: Row, reason: string, ctx: Ctx) {
+    const patch = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
+    if (!existing) return { action: "created" as const, row: await store.insert(table, patch) };
+    const edit = await store.rpc<Row>("trk_apply_edit", {
+      p_table: table, p_id: existing.id, p_fields: patch, p_reason: reason,
+      p_source: ctx.source ?? "llm", p_message_id: ctx.messageId ?? null,
+    });
+    return { action: "updated" as const, row: edit.after as Row };
+  }
 
   return {
     today,
@@ -104,7 +121,7 @@ export function dataLayer(store: Store, opts: { now?: () => Date } = {}) {
           const g = resolveGrams(item, units, food);
           if (g.grams === null) throw new InputError(`${where}: can't convert "${item.quantity ?? ""} ${item.unit ?? ""}" to grams; ask for grams`);
           resolved.push({
-            ...item, ...macrosFor(food, g.grams), grams: g.grams,
+            ...item, ...macrosFor(food, g.grams), sodium_mg: sodiumFor(food, g.grams), grams: g.grams,
             confidence: item.confidence ?? (ctx.freshFoodIds?.has(food.id) ? "label" : "saved"), grams_method: g.method,
           });
         } else {
@@ -320,6 +337,162 @@ export function dataLayer(store: Store, opts: { now?: () => Date } = {}) {
       return store.insert("trk_bodyweight", { kg, measured_at: at, day });
     },
 
+    // ───────────── water, activity, body, sleep, check-ins ─────────────
+
+    /** Everything logged on a day outside food and lifting: water, activity, sleep, check-in, measurements, routine. */
+    async dayWellness(day: string) {
+      return store.rpc<Row>("trk_day_wellness", { p_day: z.iso.date().parse(day) });
+    },
+
+    async trends(days = 30) {
+      return store.rpc<Row>("trk_trends", { p_days: z.int().min(7).max(180).parse(days), p_at: now().toISOString() });
+    },
+
+    async logWater(input: z.input<typeof S.LogWater>) {
+      const { day, drinks } = S.LogWater.parse(input);
+      const logged = [];
+      let last = day ?? (await today());
+      for (const d of drinks) {
+        last = day ?? (await logicalDay(d.drunk_at));
+        logged.push(await store.insert("trk_water", { ...d, drunk_at: d.drunk_at ?? now().toISOString(), day: last }));
+      }
+      return { logged, day: last, water: (await this.dayWellness(last)).water };
+    },
+
+    async logActivity(input: z.input<typeof S.LogActivity>) {
+      const { day, ...activity } = S.LogActivity.parse(input);
+      const d = day ?? (await logicalDay(activity.started_at));
+      const row = await store.insert("trk_activities", { ...activity, day: d });
+      const w = await this.dayWellness(d);
+      return { activity: row, day: d, activities_today: w.activities.length, active_kcal_today: w.active_kcal };
+    },
+
+    async logMeasurements(input: z.input<typeof S.LogMeasurements>) {
+      const { day, measured_at, readings } = S.LogMeasurements.parse(input);
+      const at = measured_at ?? now().toISOString();
+      const d = day ?? (await logicalDay(at));
+      const logged = [];
+      for (const r of readings) logged.push(await store.insert("trk_measurements", { ...r, measured_at: at, day: d }));
+      return { logged, day: d };
+    },
+
+    /** One night per day: logging again for the same day corrects it. */
+    async logSleep(input: z.input<typeof S.LogSleep>, ctx: Ctx = {}) {
+      const { day, ...sleep } = S.LogSleep.parse(input);
+      const d = day ?? (await logicalDay(sleep.wake_at));
+      if (sleep.bed_at && sleep.wake_at) {
+        const h = (Date.parse(sleep.wake_at) - Date.parse(sleep.bed_at)) / 3_600_000;
+        if (h <= 0 || h > 24) throw new InputError("wake_at must be after bed_at, and within 24 hours of it");
+        sleep.hours ??= Math.round(h * 100) / 100;
+      }
+      const existing = (await store.list("trk_sleep")).find((r) => r.day === d);
+      if (!existing && sleep.hours == null) throw new InputError("give hours, or both bed_at and wake_at");
+      return { day: d, ...(await upsert("trk_sleep", existing, { ...sleep, day: d }, "sleep corrected", ctx)) };
+    },
+
+    /** One check-in per day: logging again fills in or corrects the same one. */
+    async logCheckin(input: z.input<typeof S.LogCheckin>, ctx: Ctx = {}) {
+      const { day, ...checkin } = S.LogCheckin.parse(input);
+      if (!Object.values(checkin).some((v) => v !== undefined)) throw new InputError("nothing to save");
+      const d = day ?? (await today());
+      const existing = (await store.list("trk_checkins")).find((r) => r.day === d);
+      return { day: d, ...(await upsert("trk_checkins", existing, { ...checkin, day: d }, "check-in updated", ctx)) };
+    },
+
+    // ───────────── routines (supplements, skincare) ─────────────
+
+    async routine(day?: string) {
+      const d = day ?? (await today());
+      return { day: d, items: (await this.dayWellness(d)).routine as Row[] };
+    },
+
+    async saveRoutineItem(input: z.input<typeof S.SaveRoutineItem>, ctx: Ctx = {}) {
+      const { id, ...item } = S.SaveRoutineItem.parse(input);
+      const items = await store.list("trk_routine_items");
+      const existing = id ? items.find((i) => i.id === id) : items.find((i) => i.name.toLowerCase() === item.name.toLowerCase());
+      if (id && !existing) throw new InputError(`routine item ${id} not found`);
+      return upsert("trk_routine_items", existing, item, "routine item edited", ctx);
+    },
+
+    /** Ticks items off for a day. Ticking one that's already done changes nothing. */
+    async tickRoutine(input: z.input<typeof S.TickRoutine>) {
+      const { day, items: asked, all_of_kind } = S.TickRoutine.parse(input);
+      if (!asked.length && !all_of_kind) throw new InputError("give items or all_of_kind");
+      const d = day ?? (await today());
+      const items = (await store.list("trk_routine_items")).filter((i) => i.active);
+      const wanted = new Map<string, Row>();
+      const not_found: string[] = [];
+      for (const q of asked) {
+        const hit = items.find((i) => i.id === q) ?? rank(q, items, routineNames)[0];
+        const item = hit && "item" in hit ? (hit.score >= CLOSE_MATCH ? hit.item : null) : hit;
+        if (item) wanted.set(item.id, item);
+        else not_found.push(q);
+      }
+      if (all_of_kind) for (const i of items.filter((i) => i.kind === all_of_kind)) wanted.set(i.id, i);
+
+      const done = new Set((await store.list("trk_routine_logs")).filter((l) => l.day === d).map((l) => l.item_id));
+      const ticked: string[] = [];
+      const already_done: string[] = [];
+      for (const item of wanted.values()) {
+        if (done.has(item.id)) already_done.push(item.name);
+        else {
+          await store.insert("trk_routine_logs", { item_id: item.id, day: d, done_at: now().toISOString() });
+          ticked.push(item.name);
+        }
+      }
+      const routine = (await this.dayWellness(d)).routine as Row[];
+      return {
+        day: d, ticked, already_done, not_found,
+        ...(not_found.length ? { known_items: items.map((i) => i.name) } : {}),
+        still_to_do: routine.filter((r) => !r.done).map((r) => r.name),
+      };
+    },
+
+    // ───────────── notes and targets ─────────────
+
+    async getNotes(input: z.input<typeof S.GetNotes> = {}) {
+      const { kind } = S.GetNotes.parse(input);
+      return (await store.list("trk_notes"))
+        .filter((n) => !kind || n.kind === kind)
+        .map(({ id, kind, title, body, day, updated_at }) => ({ id, kind, title, body, day, updated_at }))
+        .reverse();
+    },
+
+    async saveNote(input: z.input<typeof S.SaveNote>, ctx: Ctx = {}) {
+      const { id, day, ...note } = S.SaveNote.parse(input);
+      const existing = id ? await store.get("trk_notes", id) : undefined;
+      if (id && (!existing || existing.deleted_at)) throw new InputError(`note ${id} not found`);
+      return upsert("trk_notes", existing, { ...note, ...(day || !existing ? { day: day ?? (await today()) } : {}) }, "note rewritten", ctx);
+    },
+
+    /** New targets from a day onward (unchanged ones carry over), with the reason kept as a decision note. */
+    async setTargets(input: z.input<typeof S.SetTargets>, ctx: Ctx = {}) {
+      const { effective_from, reason, ...given } = S.SetTargets.parse(input);
+      const changes = Object.fromEntries(Object.entries(given).filter(([, v]) => v !== undefined));
+      if (!Object.keys(changes).length) throw new InputError("no target given");
+      const from = effective_from ?? (await today());
+      const all = (await store.list("trk_targets")).sort((a, b) => a.effective_from.localeCompare(b.effective_from));
+      const before = all.filter((t) => t.effective_from <= from).at(-1);
+      const sameDay = before?.effective_from === from ? before : undefined;
+      const keys = ["kcal", "protein_g", "fibre_g", "carbs_g", "fat_g", "water_ml"];
+      const merged = { ...Object.fromEntries(keys.map((k) => [k, before?.[k] ?? null])), ...changes };
+      for (const k of ["kcal", "protein_g", "fibre_g"]) {
+        if (merged[k] == null) throw new InputError(`${k} is required: there are no earlier targets to carry it over from`);
+      }
+      const targets = sameDay
+        ? (await store.rpc<Row>("trk_apply_edit", {
+            p_table: "trk_targets", p_id: sameDay.id, p_fields: changes, p_reason: reason,
+            p_source: ctx.source ?? "llm", p_message_id: ctx.messageId ?? null,
+          })).after
+        : await store.insert("trk_targets", { ...merged, effective_from: from });
+      const was = before ? Object.fromEntries(Object.keys(changes).map((k) => [k, before[k] ?? null])) : null;
+      const note = await store.insert("trk_notes", {
+        kind: "decision", day: from, title: `Targets changed: ${Object.keys(changes).join(", ")}`,
+        body: `${reason}\nNow: ${JSON.stringify(changes)}${was ? `\nBefore: ${JSON.stringify(was)}` : ""}`,
+      });
+      return { targets, previous: was, decision_note_id: note.id };
+    },
+
     // ───────────── edits ─────────────
 
     async updateEntry(input: z.input<typeof S.UpdateEntry>, ctx: Ctx = {}) {
@@ -338,8 +511,8 @@ export function dataLayer(store: Store, opts: { now?: () => Date } = {}) {
       });
     },
 
-    async undoEdit(editId?: string) {
-      return store.rpc<Row>("trk_undo_edit", { p_edit_id: editId ? z.uuid().parse(editId) : null, p_source: "ui" });
+    async undoEdit(editId?: string, source: Source = "ui") {
+      return store.rpc<Row>("trk_undo_edit", { p_edit_id: editId ? z.uuid().parse(editId) : null, p_source: source });
     },
 
     async endDay(day: string) {
@@ -415,11 +588,12 @@ async function foodEntryPatch(store: Store, id: string, fields: Record<string, u
 
   if (row.food_id) {
     const food = await store.get<Row & Per100>("trk_foods", row.food_id);
-    if (food) return { ...patch, ...macrosFor(food, grams) };
+    if (food) return { ...patch, ...macrosFor(food, grams), ...("sodium_mg" in fields ? {} : { sodium_mg: sodiumFor(food, grams) }) };
   }
   if (Number(row.grams) > 0) {
     const current = Object.fromEntries(MACRO_KEYS.map((k) => [k, Number(row[k])])) as Macros;
-    return { ...patch, ...scaleMacros(current, Number(row.grams), grams) };
+    const sodium = row.sodium_mg == null || "sodium_mg" in fields ? {} : { sodium_mg: round1(Number(row.sodium_mg) * grams / Number(row.grams)) };
+    return { ...patch, ...scaleMacros(current, Number(row.grams), grams), ...sodium };
   }
   return patch;
 }

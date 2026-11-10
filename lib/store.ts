@@ -5,6 +5,8 @@ export const TABLES = [
   "trk_settings", "trk_targets", "trk_days", "trk_messages", "trk_pricing", "trk_llm_calls", "trk_edit_log",
   "trk_foods", "trk_household_units", "trk_food_entries", "trk_exercises", "trk_programs", "trk_program_days",
   "trk_program_exercises", "trk_workout_sessions", "trk_sets", "trk_bodyweight",
+  "trk_water", "trk_activities", "trk_measurements", "trk_sleep", "trk_checkins", "trk_routine_items",
+  "trk_routine_logs", "trk_notes",
 ] as const;
 export type Table = (typeof TABLES)[number];
 
