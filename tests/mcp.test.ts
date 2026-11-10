@@ -3,7 +3,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { dataLayer, type DataLayer } from "../lib/data";
 import { mcpHandle, mcpTools, MCP_VERSIONS } from "../lib/mcp";
-import type { ToolCtx } from "../lib/tools";
+import { runTool, type ToolCtx } from "../lib/tools";
 import { bunStore } from "./helpers/bun-store";
 import { hasPostgres, startPg } from "./helpers/pg";
 
@@ -154,6 +154,14 @@ describe.skipIf(!hasPostgres)("mcp", () => {
       const status = await call("get_status");
       expect(status.today).toBe(TODAY);
       expect(status.today_wellness.water.total_ml).toBe(750);
+      // asks only for what's still missing: the check-in has no stress or hunger yet, nothing is ticked
+      expect(status.not_logged_today).toEqual([
+        "rest of the check-in: stress, hunger",
+        "routine not ticked yet: Adapalene, Azelaic acid, Moisturiser, Sunscreen, Creatine, Fish oil, Vitamin D3",
+      ]);
+      // the in-app chat can't log these, so it isn't told
+      const inApp = await runTool("get_status", {}, { data });
+      expect(inApp.ok && "not_logged_today" in (inApp.result as object)).toBe(false);
 
       const rows = await call("get_entries", { from: TODAY, to: TODAY, type: "measurement" });
       expect(rows.map((r: { metric: string }) => r.metric).sort()).toEqual(["body_fat_pct", "steps"]);

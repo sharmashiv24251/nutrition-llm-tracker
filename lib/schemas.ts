@@ -205,7 +205,7 @@ export const LogMeasurements = z.object({
       .describe("snake_case with the unit: body_fat_pct, waist_cm, chest_cm, hips_cm, arm_cm, thigh_cm, steps (the day's total), resting_hr. Reuse names already in get_trends. Bodyweight goes to log_bodyweight"),
     value: z.number(),
     note: z.string().max(200).optional(),
-  })).min(1).max(20),
+  })).min(1).max(40),
 });
 
 export const LogSleep = z.object({

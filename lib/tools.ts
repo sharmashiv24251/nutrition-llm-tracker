@@ -3,6 +3,7 @@
 import type { FunctionDeclaration } from "@google/genai";
 import { z } from "zod";
 import type { DataLayer, Source } from "./data";
+import type { Row } from "./store";
 import type { Mode } from "./prompt";
 import * as S from "./schemas";
 
@@ -35,17 +36,38 @@ const MCP_ONLY: Mode[] = [];
 const day = z.iso.date().describe("Logical day, YYYY-MM-DD");
 const none = z.object({});
 
+/** What's still missing from today's log, most worth asking first, phrased as things to ask me. */
+function notLoggedToday(status: Row, wellness: Row, weighed: boolean): string[] {
+  const out: string[] = [];
+  const c = wellness.checkin;
+  const scores = ["energy", "mood", "stress", "hunger"].filter((k) => c?.[k] == null);
+  if (!c) out.push("check-in: energy, mood, stress and hunger (1 to 5) and how my skin looks");
+  else if (scores.length || !c.skin) out.push(`rest of the check-in: ${[...scores, ...(c.skin ? [] : ["skin"])].join(", ")}`);
+  if (!wellness.sleep) out.push("last night's sleep: bed time, wake time and how well I slept");
+  if (!weighed) out.push("morning weight");
+  const due = (wellness.routine as Row[]).filter((r) => !r.done).map((r) => r.name);
+  if (due.length) out.push(`routine not ticked yet: ${due.join(", ")}`);
+  if (!wellness.water.total_ml) out.push("water so far");
+  if (!status.today_summary?.entries) out.push("what I've eaten so far");
+  if (wellness.steps == null) out.push("step count (ask in the evening)");
+  return out;
+}
+
 // Read tools work in both chats so any question can be answered anywhere. Write tools belong to their chat
 // (food or workout) to keep each request's tool list, and so its input tokens, smaller.
 export const TOOLS: Tool[] = [
   // ───────────── reading: days and history ─────────────
   tool({
     name: "get_status",
-    description: "Returns now: the current time, today's and yesterday's logical day, days still open, today's food totals vs targets, the active workout session (if any), the active program and which program day is next in the rotation, and today's water, activity, sleep, check-in and routine ticks. Call it before anything that depends on the date or on what's already logged today.",
+    description: "Returns now: the current time, today's and yesterday's logical day, days still open, today's food totals vs targets, the active workout session (if any), the active program and which program day is next in the rotation, today's water, activity, sleep, check-in and routine ticks, and not_logged_today: what I haven't told you yet today, for you to ask me about. Call it at the start of every conversation and before anything that depends on the date or on what's already logged today.",
     schema: none,
-    run: async (_, { data }) => {
+    run: async (_, { data, source }) => {
       const status = await data.getStatus();
-      return { ...status, today_wellness: await data.dayWellness(status.today) };
+      const wellness = await data.dayWellness(status.today);
+      // Only MCP clients can log these, so only they are told what's missing.
+      if (source !== "mcp") return { ...status, today_wellness: wellness };
+      const weighed = await data.getEntries({ from: status.today, to: status.today, type: "bodyweight" });
+      return { ...status, today_wellness: wellness, not_logged_today: notLoggedToday(status, wellness, weighed.length > 0) };
     },
   }),
   tool({
